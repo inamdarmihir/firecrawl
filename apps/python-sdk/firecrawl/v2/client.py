@@ -5,7 +5,7 @@ This module provides the main client class that orchestrates all v2 functionalit
 """
 
 import os
-from typing import Optional, List, Dict, Any, Callable, Union, Literal  # noqa: F401
+from typing import Optional, List, Dict, Any, Callable, Union, Literal
 from .types import (
     ClientConfig,
     ScrapeOptions,
@@ -41,7 +41,6 @@ from .types import (
     AgentOptions,
 )
 from .utils.http_client import HttpClient
-from .utils.error_handler import FirecrawlError
 from .methods import scrape as scrape_module
 from .methods import crawl as crawl_module
 from .methods import batch as batch_module
