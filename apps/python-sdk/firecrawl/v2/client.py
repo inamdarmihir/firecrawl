@@ -651,9 +651,10 @@ class FirecrawlClient:
         *,
         qdrant_client: Any,
         collection_name: str,
-        embedding_fn: Callable,
+        embedding_fn: Callable[[str], List[float]],
         skip_existing: bool = True,
         content_key: str = "markdown",
+        batch_size: int = 100,
         prompt: Optional[str] = None,
         exclude_paths: Optional[List[str]] = None,
         include_paths: Optional[List[str]] = None,
@@ -666,7 +667,7 @@ class FirecrawlClient:
         ignore_robots_txt: bool = False,
         delay: Optional[int] = None,
         max_concurrency: Optional[int] = None,
-        scrape_options=None,
+        scrape_options: Optional[ScrapeOptions] = None,
         deduplicate_similar_urls: bool = True,
         zero_data_retention: bool = False,
         poll_interval: int = 2,
@@ -691,6 +692,8 @@ class FirecrawlClient:
                 (default ``True``).
             content_key: Document field to embed — ``"markdown"`` (default),
                 ``"html"``, or ``"raw_html"``.
+            batch_size: Points per Qdrant upsert call (default 100).  Failed
+                batches are retried one point at a time.
             prompt: Optional natural-language prompt to guide the crawl.
             exclude_paths: URL patterns to exclude.
             include_paths: URL patterns to include.
@@ -731,6 +734,7 @@ class FirecrawlClient:
             embedding_fn=embedding_fn,
             skip_existing=skip_existing,
             content_key=content_key,
+            batch_size=batch_size,
             prompt=prompt,
             exclude_paths=exclude_paths,
             include_paths=include_paths,

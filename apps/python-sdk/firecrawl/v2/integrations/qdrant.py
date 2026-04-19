@@ -39,12 +39,15 @@ import uuid
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from ..types import CrawlJob, Document
 
 logger = logging.getLogger("firecrawl")
+
+# Number of points sent to Qdrant in a single upsert call.
+_DEFAULT_BATCH_SIZE = 100
 
 
 @dataclass
@@ -54,10 +57,16 @@ class CrawlToStoreResult:
     Attributes:
         total:      Total pages returned by the crawl.
         upserted:   Pages inserted or updated in Qdrant.
-        skipped:    Pages skipped because an identical copy already existed.
-        updated:    Subset of *upserted* pages where content changed since last crawl.
+        skipped:    Pages not upserted — either because an identical copy
+                    already existed in Qdrant (``skip_existing=True``) or
+                    because the document had no usable content for the chosen
+                    ``content_key``.
+        updated:    Subset of *upserted* pages where content changed since the
+                    last crawl (existing point was overwritten).
         crawl_job:  The completed :class:`~firecrawl.v2.types.CrawlJob`.
-        errors:     Any per-page errors encountered during upsert (url → error message).
+        errors:     Per-page errors encountered during embedding or upsert
+                    (url → error message).  Pages with errors are not counted
+                    in *upserted* or *skipped*.
     """
 
     total: int
@@ -114,32 +123,67 @@ def _url_to_point_id(url: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, url))
 
 
-def _find_existing_point(qdrant_client: Any, collection_name: str, url: str):
+def _retrieve_existing_point(qdrant_client: Any, collection_name: str, point_id: str):
     """
-    Scroll Qdrant for a point whose payload ``url`` matches *url*.
+    Fetch a single point by its deterministic *point_id* from Qdrant.
 
-    Returns the first matching point or ``None``.
+    Uses ``retrieve()`` (a direct O(1) key lookup) rather than a payload
+    filter scroll, so no payload index on ``url`` is required.
+
+    Returns the point record or ``None`` if not found.
     """
-    try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-    except ImportError:
-        raise ImportError(
-            "qdrant-client is required for Qdrant integration. "
-            "Install it with: pip install qdrant-client"
-        )
-
-    url_filter = Filter(
-        must=[FieldCondition(key="url", match=MatchValue(value=url))]
-    )
-
-    results, _ = qdrant_client.scroll(
+    results = qdrant_client.retrieve(
         collection_name=collection_name,
-        scroll_filter=url_filter,
-        limit=1,
+        ids=[point_id],
         with_payload=True,
         with_vectors=False,
     )
     return results[0] if results else None
+
+
+def _flush_batch(
+    qdrant_client: Any,
+    collection_name: str,
+    batch: List[Any],  # List[PointStruct]
+    batch_meta: List[Tuple[str, bool]],  # (url, is_update) per point
+    errors: Dict[str, str],
+) -> Tuple[int, int]:
+    """
+    Upsert *batch* into Qdrant and return ``(upserted_count, updated_count)``.
+
+    On batch failure every URL in the batch is individually retried so that a
+    single bad document does not silently discard the rest.  Per-URL errors are
+    recorded in *errors*.
+    """
+    if not batch:
+        return 0, 0
+
+    try:
+        qdrant_client.upsert(collection_name=collection_name, points=batch)
+        upserted = len(batch)
+        updated = sum(1 for _, is_upd in batch_meta if is_upd)
+        return upserted, updated
+    except Exception as batch_exc:
+        logger.warning(
+            "Batch upsert failed (%s), retrying individually: %s",
+            collection_name,
+            batch_exc,
+        )
+
+    upserted = updated = 0
+    for point, (url, is_update) in zip(batch, batch_meta):
+        try:
+            qdrant_client.upsert(collection_name=collection_name, points=[point])
+            upserted += 1
+            if is_update:
+                updated += 1
+        except Exception as exc:
+            msg = f"Qdrant upsert failed: {exc}"
+            logger.warning("%s (url=%s)", msg, url)
+            if url:
+                errors[url] = msg
+
+    return upserted, updated
 
 
 def crawl_to_store(
@@ -151,6 +195,7 @@ def crawl_to_store(
     embedding_fn: Callable[[str], List[float]],
     skip_existing: bool = True,
     content_key: str = "markdown",
+    batch_size: int = _DEFAULT_BATCH_SIZE,
     # ---- crawl kwargs forwarded verbatim ----
     prompt: Optional[str] = None,
     exclude_paths: Optional[List[str]] = None,
@@ -175,9 +220,18 @@ def crawl_to_store(
     Crawl *url* and upsert the resulting pages into a Qdrant collection.
 
     When *skip_existing* is ``True`` (the default) each page is looked up in
-    Qdrant by its URL before embedding.  Pages whose content hash has not
-    changed since the previous crawl are skipped entirely, making repeated
-    crawls of the same site dramatically cheaper.
+    Qdrant by its deterministic point ID before embedding.  Pages whose content
+    hash has not changed since the previous crawl are skipped entirely, making
+    repeated crawls of the same site dramatically cheaper.
+
+    Point IDs are derived from the page URL via UUID v5 so that every re-crawl
+    upserts to the same slot rather than creating duplicates.  Deduplication
+    checks use ``qdrant_client.retrieve()`` — a direct O(1) key lookup — so no
+    payload index on the ``url`` field is required.
+
+    Vectors are sent to Qdrant in batches (``batch_size`` points per request)
+    to minimise round-trips for large crawls.  If a batch fails it is retried
+    one point at a time so a single bad document does not drop the rest.
 
     Args:
         firecrawl_client: A :class:`~firecrawl.v2.client.FirecrawlClient` (or
@@ -187,15 +241,16 @@ def crawl_to_store(
         collection_name: Name of the target Qdrant collection.  The collection
             must already exist with a vector size that matches the output of
             *embedding_fn*.
-        embedding_fn: A callable that accepts a string and returns a list of
-            floats (the embedding vector).  Called once per page that needs to
-            be upserted.
+        embedding_fn: A callable ``(text: str) -> List[float]`` returning the
+            embedding vector.  Called once per page that needs to be upserted.
         skip_existing: When ``True`` (default), pages already stored in Qdrant
             with an identical content hash are skipped.  Set to ``False`` to
             always re-embed and overwrite.
         content_key: Which :class:`~firecrawl.v2.types.Document` field to use
             as the text for hashing and embedding.  Defaults to ``"markdown"``.
             Accepted values: ``"markdown"``, ``"html"``, ``"raw_html"``.
+        batch_size: Number of points sent to Qdrant in a single upsert call
+            (default 100).
         prompt: Optional natural-language prompt to guide the crawl.
         exclude_paths: URL path patterns to exclude.
         include_paths: URL path patterns to include.
@@ -239,6 +294,9 @@ def crawl_to_store(
             f"content_key must be one of {valid_content_keys!r}, got {content_key!r}"
         )
 
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size!r}")
+
     # Run the crawl
     crawl_job = firecrawl_client.crawl(
         url,
@@ -269,6 +327,22 @@ def crawl_to_store(
     updated = 0
     errors: Dict[str, str] = {}
 
+    # Pending batch accumulator: (PointStruct, url, is_update)
+    batch: List[Any] = []
+    batch_meta: List[Tuple[str, bool]] = []
+
+    def _flush() -> None:
+        nonlocal upserted, updated
+        if not batch:
+            return
+        # Pass copies so that clearing the accumulators below does not
+        # retroactively affect the snapshot sent to Qdrant (or to mocks).
+        u, upd = _flush_batch(qdrant_client, collection_name, list(batch), list(batch_meta), errors)
+        upserted += u
+        updated += upd
+        batch.clear()
+        batch_meta.clear()
+
     for doc in documents:
         doc_url = _url_for_doc(doc)
         content = _get_content(doc, content_key)
@@ -282,21 +356,26 @@ def crawl_to_store(
             logger.warning("Document has no URL in metadata; generating a random point ID.")
 
         current_hash = _content_hash(content)
+        point_id = _url_to_point_id(doc_url) if doc_url else str(uuid.uuid4())
 
-        # Determine whether to upsert
+        # Deduplication check via direct O(1) retrieve by deterministic point ID
         is_update = False
         if skip_existing and doc_url:
-            existing = _find_existing_point(qdrant_client, collection_name, doc_url)
+            existing = _retrieve_existing_point(qdrant_client, collection_name, point_id)
             if existing is not None:
                 existing_hash = (existing.payload or {}).get("content_hash")
                 if existing_hash == current_hash:
                     skipped += 1
                     logger.debug("Skipping unchanged page: %s", doc_url)
                     continue
+                # Content changed — overwrite the existing point in-place using
+                # its own ID (always equal to point_id since IDs are deterministic,
+                # but being explicit guards against any future ID scheme changes).
+                point_id = existing.id
                 is_update = True
                 logger.debug("Updating changed page: %s", doc_url)
 
-        # Embed and upsert
+        # Embed
         try:
             vector = embedding_fn(content)
         except Exception as exc:
@@ -306,22 +385,15 @@ def crawl_to_store(
                 errors[doc_url] = msg
             continue
 
-        point_id = _url_to_point_id(doc_url) if doc_url else str(uuid.uuid4())
         payload = _doc_to_payload(doc, content_key, current_hash)
+        batch.append(PointStruct(id=point_id, vector=vector, payload=payload))
+        batch_meta.append((doc_url or "", is_update))
 
-        try:
-            qdrant_client.upsert(
-                collection_name=collection_name,
-                points=[PointStruct(id=point_id, vector=vector, payload=payload)],
-            )
-            upserted += 1
-            if is_update:
-                updated += 1
-        except Exception as exc:
-            msg = f"Qdrant upsert failed: {exc}"
-            logger.warning("%s (url=%s)", msg, doc_url)
-            if doc_url:
-                errors[doc_url] = msg
+        if len(batch) >= batch_size:
+            _flush()
+
+    # Flush remaining points
+    _flush()
 
     return CrawlToStoreResult(
         total=total,
